@@ -1,3 +1,4 @@
+// buddy_allocator.h
 #ifndef BUDDY_ALLOCATOR_H
 #define BUDDY_ALLOCATOR_H
 
@@ -17,6 +18,10 @@ public:
     // Cache de memoria para operaciones repetitivas
     void* getCache(size_t size);
     void releaseCache();
+
+    // Métodos para diagnóstico
+    size_t getTotalSize() const { return totalSize; }
+    void printStatus() const; // Método para imprimir estado del allocator
 
 private:
     static const size_t MIN_BLOCK_SIZE = 64;  // Incrementado para mejor rendimiento
@@ -38,9 +43,9 @@ private:
     size_t getBlockSize(int level) const;
     size_t offset(void* ptr) const;
     void* buddyOf(void* ptr, int level) const;
-    void split(int level);
+    bool split(int level); // Modificado para retornar éxito/fallo
     void coalesce(void* ptr, int level);
     bool isAligned(void* ptr, size_t alignment) const;
 };
 
-#endif
+#endif // BUDDY_ALLOCATOR_H

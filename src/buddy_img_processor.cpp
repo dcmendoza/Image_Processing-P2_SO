@@ -1,3 +1,4 @@
+// buddy_img_processor.cpp
 #include "buddy_img_processor.h"
 #include "../buddy_system/stb_image.h"
 #include "../buddy_system/stb_image_write.h"
@@ -7,7 +8,7 @@
 #include <cstring>
 
 // Crear una instancia global optimizada del allocator
-static BuddyAllocator globalAllocator(1024 * 1024 * 100); // 100MB
+static BuddyAllocator globalAllocator(1024 * 1024 * 256); // 256MB (incrementado para soportar imágenes grandes)
 
 ImagenOptimizada::ImagenOptimizada(const std::string& ruta, BuddyAllocator* allocator)
     : allocator(allocator ? allocator : &globalAllocator) {
@@ -19,9 +20,21 @@ ImagenOptimizada::ImagenOptimizada(const std::string& ruta, BuddyAllocator* allo
         exit(1);
     }
     
-    // Copiar el buffer a memoria administrada por el buddy allocator
+    // Mostrar información de la imagen cargada
+    std::cout << "Imagen cargada: " << ancho << "x" << alto << " con " << canales << " canales.\n";
+    
+    // Calcular tamaño del buffer
     size_t tamBuffer = ancho * alto * canales;
+    std::cout << "Tamaño del buffer: " << tamBuffer << " bytes\n";
+    
+    // Copiar el buffer a memoria administrada por el buddy allocator
     unsigned char* buddyBuffer = static_cast<unsigned char*>(this->allocator->alloc(tamBuffer));
+    if (!buddyBuffer) {
+        std::cerr << "Error: No se pudo asignar memoria para el buffer de imagen.\n";
+        stbi_image_free(buffer);
+        exit(1);
+    }
+    
     std::memcpy(buddyBuffer, buffer, tamBuffer);
     
     // Liberar el buffer original y usar el buffer del buddy
@@ -36,6 +49,11 @@ ImagenOptimizada::~ImagenOptimizada() {
 }
 
 void ImagenOptimizada::guardarImagen(const std::string& ruta) const {
+    if (!buffer) {
+        std::cerr << "Error: No hay datos de imagen para guardar.\n";
+        return;
+    }
+    
     if (!stbi_write_jpg(ruta.c_str(), ancho, alto, canales, buffer, 95)) {
         std::cerr << "Error: No se pudo guardar la imagen en '" << ruta << "'.\n";
         exit(1);
@@ -46,6 +64,7 @@ void ImagenOptimizada::guardarImagen(const std::string& ruta) const {
 void ImagenOptimizada::mostrarInfo() const {
     std::cout << "Dimensiones: " << ancho << " x " << alto << std::endl;
     std::cout << "Canales: " << canales << std::endl;
+    std::cout << "Tamaño total: " << (ancho * alto * canales) << " bytes" << std::endl;
 }
 
 unsigned char ImagenOptimizada::interpolacion_bilineal(float x, float y, int c) const {
@@ -81,6 +100,8 @@ unsigned char ImagenOptimizada::interpolacion_bilineal(float x, float y, int c) 
 void ImagenOptimizada::rotar(int angulo) {
     if (angulo == 0) return;  // No hacer nada si el ángulo es 0
     
+    std::cout << "Rotando imagen " << angulo << " grados...\n";
+    
     float radianes = angulo * M_PI / 180.0f;
     float cosA = cos(radianes);
     float sinA = sin(radianes);
@@ -92,6 +113,13 @@ void ImagenOptimizada::rotar(int angulo) {
     // Reservar buffer para la imagen rotada
     size_t tamBuffer = ancho * alto * canales;
     unsigned char* rotadaBuffer = static_cast<unsigned char*>(allocator->getCache(tamBuffer));
+    if (!rotadaBuffer) {
+        std::cerr << "Error: No se pudo asignar memoria para la imagen rotada.\n";
+        return; // No modificar la imagen si no se puede asignar memoria
+    }
+    
+    // Inicializar buffer con negro
+    std::memset(rotadaBuffer, 0, tamBuffer);
     
     // Aplicar rotación a cada pixel
     #pragma omp parallel for collapse(2)
@@ -116,17 +144,38 @@ void ImagenOptimizada::rotar(int angulo) {
     // Intercambiar los buffers
     std::swap(buffer, rotadaBuffer);
     allocator->releaseCache();
+    
+    std::cout << "Rotación completada.\n";
 }
 
 void ImagenOptimizada::escalar(float factor) {
     if (factor == 1.0f) return;  // No hacer nada si el factor es 1
     
+    std::cout << "Escalando imagen por factor " << factor << "...\n";
+    
     int nuevoAncho = static_cast<int>(ancho * factor);
     int nuevoAlto = static_cast<int>(alto * factor);
     
-    // Reservar buffer para la imagen escalada
+    // Calcular y mostrar el nuevo tamaño
     size_t tamBuffer = nuevoAncho * nuevoAlto * canales;
+    std::cout << "Nuevo tamaño: " << nuevoAncho << "x" << nuevoAlto 
+              << " (" << tamBuffer << " bytes)\n";
+    
+    // Verificar límites razonables
+    if (nuevoAncho <= 0 || nuevoAlto <= 0 || nuevoAncho > 20000 || nuevoAlto > 20000) {
+        std::cerr << "Error: Factor de escala " << factor << " produce dimensiones no válidas.\n";
+        return;
+    }
+    
+    // Reservar buffer para la imagen escalada
     unsigned char* escaladaBuffer = static_cast<unsigned char*>(allocator->alloc(tamBuffer));
+    if (!escaladaBuffer) {
+        std::cerr << "Error: No se pudo asignar memoria para la imagen escalada.\n";
+        return; // No modificar la imagen si no se puede asignar memoria
+    }
+    
+    // Inicializar buffer con negro
+    std::memset(escaladaBuffer, 0, tamBuffer);
     
     // Aplicar escalado
     #pragma omp parallel for collapse(2)
@@ -144,10 +193,17 @@ void ImagenOptimizada::escalar(float factor) {
     }
     
     // Actualizar los atributos de la imagen
-    allocator->free(buffer);
+    void* oldBuffer = buffer;
     buffer = escaladaBuffer;
     ancho = nuevoAncho;
     alto = nuevoAlto;
+    
+    // Liberar buffer antiguo
+    if (oldBuffer) {
+        allocator->free(oldBuffer);
+    }
+    
+    std::cout << "Escalado completado.\n";
 }
 
 // Implementaciones de las funciones wrapper

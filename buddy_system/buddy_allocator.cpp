@@ -1,3 +1,4 @@
+// buddy_system/buddy_allocator.cpp
 #include "buddy_allocator.h"
 #include <cmath>
 #include <cstdlib>
@@ -12,7 +13,7 @@ BuddyAllocator::BuddyAllocator(size_t size) {
     // Redondear al siguiente poder de 2
     totalSize = 1ULL << static_cast<int>(std::ceil(std::log2(size)));
     
-    // Alinear memoria a 64 bytes para mejor rendimiento SIMD
+    // Alinear memoria a 64 bytes
     posix_memalign(&memoryBase, 64, totalSize);
     if (!memoryBase) {
         std::cerr << "Error: no se pudo reservar memoria inicial alineada\n";
@@ -20,8 +21,6 @@ BuddyAllocator::BuddyAllocator(size_t size) {
     }
 
     std::memset(freeLists, 0, sizeof(freeLists));
-    
-    // Inicializar cache
     cacheMemory = nullptr;
     cacheSize = 0;
 
@@ -32,19 +31,18 @@ BuddyAllocator::BuddyAllocator(size_t size) {
 }
 
 BuddyAllocator::~BuddyAllocator() {
-    if (cacheMemory) {
-        std::free(cacheMemory);
-    }
+    if (cacheMemory) std::free(cacheMemory);
     std::free(memoryBase);
 }
 
 int BuddyAllocator::getLevel(size_t size) const {
     size = std::max(size, MIN_BLOCK_SIZE);
     size_t paddedSize = size + sizeof(Block);
-    
+
     int level = 0;
     size_t block = MIN_BLOCK_SIZE;
-    while (block < paddedSize && level < MAX_LEVELS) {
+    // Nunca dejar level ≥ MAX_LEVELS
+    while (block < paddedSize && level < MAX_LEVELS - 1) {
         block <<= 1;
         ++level;
     }
@@ -56,96 +54,71 @@ size_t BuddyAllocator::getBlockSize(int level) const {
 }
 
 void* BuddyAllocator::alloc(size_t size) {
-    // Usar caché para asignaciones temporales pequeñas
     if (size <= 4096 && cacheMemory && cacheSize >= size) {
-        void* result = cacheMemory;
+        void* r = cacheMemory;
         cacheMemory = nullptr;
-        return result;
+        return r;
     }
-    
+
     int level = getLevel(size);
     size_t reqBlockSize = getBlockSize(level);
 
     int l = level;
     while (l < MAX_LEVELS && !freeLists[l]) ++l;
-
     if (l == MAX_LEVELS) {
         std::cerr << "Error: no hay bloques suficientes para " << size << " bytes\n";
         return nullptr;
     }
 
+    // Splitea hasta alcanzar el nivel deseado
     while (l > level) {
-        split(l);
+        if (!split(l)) {
+            std::cerr << "Error: fallo en la división de bloques\n";
+            return nullptr;
+        }
         --l;
     }
 
     Block* block = freeLists[level];
     freeLists[level] = block->next;
-    
-    // Reservar espacio para almacenar la información del bloque
-    Block* headerBlock = block;
-    headerBlock->size = size;
-    
-    // Registrar el bloque para liberación posterior
+    block->size = size;
     allocatedBlocks[block] = level;
-    
-    // Devolver el espacio después del encabezado
-    return static_cast<void*>(static_cast<char*>(static_cast<void*>(block)) + sizeof(Block));
+
+    return static_cast<void*>(
+        static_cast<char*>(static_cast<void*>(block)) + sizeof(Block)
+    );
 }
 
 void BuddyAllocator::free(void* ptr) {
     if (!ptr) return;
-    
-    // Ajustar el puntero para obtener el encabezado del bloque
     void* blockPtr = static_cast<char*>(ptr) - sizeof(Block);
-    
     auto it = allocatedBlocks.find(blockPtr);
     if (it == allocatedBlocks.end()) {
         std::cerr << "Error: intento de liberar un puntero no asignado\n";
         return;
     }
-    
     int level = it->second;
     allocatedBlocks.erase(it);
-    
     coalesce(blockPtr, level);
 }
 
 void* BuddyAllocator::realloc(void* ptr, size_t newSize) {
     if (!ptr) return alloc(newSize);
-    if (newSize == 0) {
-        free(ptr);
-        return nullptr;
-    }
-    
-    // Obtener el encabezado del bloque
+    if (newSize == 0) { free(ptr); return nullptr; }
+
     Block* block = reinterpret_cast<Block*>(static_cast<char*>(ptr) - sizeof(Block));
-    
-    // Si el nuevo tamaño es menor o igual al actual, simplemente devolver el mismo puntero
-    if (newSize <= block->size) {
-        return ptr;
-    }
-    
-    // Asignar un nuevo bloque
+    if (newSize <= block->size) return ptr;
+
     void* newPtr = alloc(newSize);
     if (!newPtr) return nullptr;
-    
-    // Copiar los datos antiguos al nuevo bloque
     std::memcpy(newPtr, ptr, block->size);
-    
-    // Liberar el bloque antiguo
     free(ptr);
-    
     return newPtr;
 }
 
 void* BuddyAllocator::getCache(size_t size) {
-    if (cacheMemory && cacheSize >= size)
-        return cacheMemory;
-        
-    if (cacheMemory)
-        std::free(cacheMemory);
-        
+    if (cacheMemory && cacheSize >= size) return cacheMemory;
+    if (cacheMemory) std::free(cacheMemory);
     cacheSize = size;
     cacheMemory = std::aligned_alloc(64, size);
     return cacheMemory;
@@ -170,22 +143,35 @@ size_t BuddyAllocator::offset(void* ptr) const {
     return static_cast<char*>(ptr) - static_cast<char*>(memoryBase);
 }
 
-void BuddyAllocator::split(int level) {
+// <-- Aquí cambiamos void por bool y añadimos retornos true/false -->
+bool BuddyAllocator::split(int level) {
     Block* block = freeLists[level];
-    if (!block) return;
+    if (!block) return false;
 
     freeLists[level] = block->next;
+    size_t halfSize = getBlockSize(level - 1);
 
-    size_t size = getBlockSize(level - 1);
+    // Asegurarnos de no salirnos del pool
+    Block* second = reinterpret_cast<Block*>(
+        reinterpret_cast<char*>(block) + halfSize
+    );
+    if (reinterpret_cast<char*>(second) + sizeof(Block)
+        > reinterpret_cast<char*>(memoryBase) + totalSize) {
+        // devolvemos el bloque original
+        block->next = freeLists[level];
+        freeLists[level] = block;
+        return false;
+    }
+
     Block* first = block;
-    Block* second = reinterpret_cast<Block*>(reinterpret_cast<char*>(block) + size);
     first->next = nullptr;
     second->next = nullptr;
-    first->size = size - sizeof(Block);
-    second->size = size - sizeof(Block);
+    first->size  = halfSize - sizeof(Block);
+    second->size = halfSize - sizeof(Block);
 
     freeLists[level - 1] = first;
     first->next = second;
+    return true;
 }
 
 void BuddyAllocator::coalesce(void* ptr, int level) {
